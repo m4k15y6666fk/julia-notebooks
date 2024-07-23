@@ -1,0 +1,278 @@
+---
+title: RNN(GRU) によるテキスト生成
+jupyter:
+  jupytext:
+    text_representation:
+      extension: .qmd
+      format_name: quarto
+      format_version: '1.0'
+      jupytext_version: 1.16.3
+  kernelspec:
+    display_name: Julia 1.6.7
+    language: julia
+    name: julia-1.6
+---
+
+```{julia}
+using Dates
+
+"Last Updated: " * (string ∘ now)()
+```
+
+※ 特に記載のない限り、このノートブックのコンテンツは [クリエイティブ・コモンズの表示 4.0 ライセンス](https://creativecommons.org/licenses/by/4.0/deed.ja) により使用許諾されます。コードサンプルは [Apache 2.0 ライセンス](https://www.apache.org/licenses/LICENSE-2.0.html) により使用許諾されます。
+
+
+## データセットの準備
+
+シェイクスピアのテキストからデータセットを作成します。
+
+```{julia}
+using HTTP
+
+response = HTTP.request("GET", "https://storage.googleapis.com/download.tensorflow.org/data/shakespeare.txt")
+text = String(response.body)
+```
+
+```{julia}
+isfile("shakespeare.txt") || download(
+    # "https://cs.stanford.edu/people/karpathy/char-rnn/shakespeare_input.txt",
+    "https://storage.googleapis.com/download.tensorflow.org/data/shakespeare.txt",
+    "shakespeare.txt",
+)
+
+text = (
+    () -> begin
+        _io = open("shakespeare.txt", "r")
+        _text = read(_io, String)
+
+        close(_io)
+
+        return _text
+    end
+)()
+```
+
+```{julia}
+chars = sort([x for x in Set(text)])
+```
+
+```{julia}
+char2idx = Dict([(y, x) for (x, y) in enumerate(chars)])
+```
+
+```{julia}
+idx2char = chars
+```
+
+```{julia}
+for i in 1:65
+    @assert i == char2idx[idx2char[i]]
+end
+```
+
+```{julia}
+text_as_int = [char2idx[c] for c in text]
+```
+
+```{julia}
+using Flux
+
+# ひとつの入力としたいシーケンスの文字数としての最大の長さ
+seq_length = 100
+
+# sequences = [text_as_int[r] for r in vec]
+data_input = Flux.chunk(text_as_int[begin:(end - 1)]; size = seq_length)
+data_input = filter(x -> length(x) == seq_length, data_input)
+
+data_expect = Flux.chunk(text_as_int[(begin + 1):end]; size = seq_length)
+data_expect = filter(x -> length(x) == seq_length, data_expect)
+
+
+@show data_input |> summary
+@show data_input |> first |> summary
+
+@show data_expect |> summary
+@show data_expect |> first |> summary
+```
+
+```{julia}
+@show data_input |> size
+@show data_input |> first |> size
+```
+
+```{julia}
+_loader = Flux.DataLoader((data_input, data_expect); batchsize=2, buffer=true, partial=false, shuffle=false)
+
+for (x, y) in _loader
+    @show x |> Flux.batchseq
+    @show y |> Flux.batchseq
+
+    break
+end
+```
+
+## 学習 / Training
+
+```{julia}
+using Flux
+
+L = length(idx2char)
+
+function build_model()
+    return Flux.Chain(
+        Flux.Embedding(L => 256),
+        Flux.GRU(256 => 1024),
+        Flux.Dense(1024 => L)
+    )
+end
+```
+
+```{julia}
+import JLD2
+
+function load_checkpoint()
+    if isfile("model-checkpoint.jld2")
+        m = build_model()
+        e, s = JLD2.load("model-checkpoint.jld2", "epoch", "model_state")
+
+        # Flux.reset!(m)
+        # Flux.reset!(s)
+
+        # m |> summary |> println
+
+        # Flux.state(m) |> summary |> println
+        # s |> summary |> println
+
+        Flux.loadmodel!(m, s)
+
+        return e, m
+    end
+
+    return 0, ()
+end
+```
+
+```{julia}
+import JLD2
+
+function save_checkpoint(m; filename = "model-checkpoint", epoch = 0)
+    filename isa String || error("$(filename) is not String")
+
+    Flux.reset!(m)
+    JLD2.jldsave(filename * ".jld2"; epoch, model_state = Flux.state(m))
+end
+```
+
+```{julia}
+#epoch_done, model = 0, build_model()
+
+epoch_done, model = load_checkpoint("model-checkpoint.jld2")
+```
+
+```{julia}
+using Flux
+
+opt = Flux.setup(Flux.Adam(), model)
+```
+
+```{julia}
+using Flux
+
+import Statistics
+
+
+num_epoch = 1
+
+loader = Flux.DataLoader((data_input, data_expect); batchsize=64, buffer=true, partial=false, shuffle=true)
+
+
+global step = 0
+for epoch in (epoch_done + 1):(epoch_done + num_epoch)
+    println("[ Epoch ", epoch, " ]")
+
+    global step = 0
+    Flux.train!(model, loader, opt) do m, x, y
+        global step += 1
+
+        Flux.reset!(m)
+
+        bx = Flux.batchseq(x)
+        by = Flux.batchseq(y)
+
+        prediction = [m(bxi) for bxi in bx]
+        # @show prediction |> summary
+        # @show prediction |> first |> summary
+
+        onehot_expect = [Flux.onehotbatch(byi, 1:L) for byi in by]
+        # @show onehot_expect |> summary
+        # @show onehot_expect |> first |> summary
+
+        _loss = Flux.logitcrossentropy.(prediction, onehot_expect; agg = Statistics.mean) |> Statistics.mean
+
+        # _acc = Statistics.mean(Flux.onecold(prediction, 1:65) .== y)
+
+        print("\r", "step : ", step, " | loss : ", _loss) #, " | acc : ", _acc)
+
+        return _loss
+    end
+
+    println("")
+
+    print("Saving model checkpoint...")
+    save_checkpoint(model; filename = "model-checkpoint", epoch)
+    println(" Done.")
+end
+```
+
+## モデルのロードとテキスト生成 / Load and Generate
+
+```{julia}
+#epoch_done, model = 0, build_model()
+
+epoch_done, model = load_checkpoint("model-checkpoint.jld2")
+```
+
+```{julia}
+using Flux
+import Distributions
+
+function categorical_sample(p; temperature = 1.0)
+    _p = p ./ temperature |> Flux.softmax
+    _d = Distributions.Categorical(_p)
+
+    return rand(_d, 1)[begin]
+end
+```
+
+```{julia}
+function generate_text(init_text; generate_length = 256, temperature = 1.0)
+    _init_chars = collect(init_text)
+
+    _buf = IOBuffer()
+
+    if length(_init_chars) > 1
+        for c in _init_chars[begin:(end - 1)]
+            model([char2idx[c]])
+        end
+    end
+    _predict_vector = model([char2idx[_init_chars[end]]]) |> Flux.unbatch |> first
+    # _predict_vector |> summary |> println
+    global _predict_char = categorical_sample(_predict_vector; temperature) |> n -> idx2char[n]
+
+    write(_buf, _predict_char)
+
+    for i in 1:generate_length
+        _predict_vector = model([char2idx[_predict_char]]) |> Flux.unbatch |> first
+        # _predict_vector |> summary |> println
+        global _predict_char = categorical_sample(_predict_vector; temperature) |> n -> idx2char[n]
+    
+        write(_buf, _predict_char)
+    end
+
+    return _buf |> take! |> String
+end
+```
+
+```{julia}
+generate_text("Citizens:"; generate_length = 1024)
+```
